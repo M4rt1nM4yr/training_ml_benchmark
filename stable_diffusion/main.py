@@ -10,29 +10,19 @@ import numpy as np
 import torch
 import torchvision
 
-try:
-    import lightning.pytorch as pl
-except:
-    import pytorch_lightning as pl
+import lightning.pytorch as pl
+from lightning.pytorch import seed_everything
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.trainer import Trainer
+from lightning.pytorch.utilities import rank_zero_info
+
+LIGHTNING_PACK_NAME = "lightning.pytorch."
 
 from functools import partial
 
 from omegaconf import OmegaConf
 from prefetch_generator import BackgroundGenerator
 from torch.utils.data import DataLoader, Dataset
-
-try:
-    from lightning.pytorch import seed_everything
-    from lightning.pytorch.callbacks import Callback
-    from lightning.pytorch.trainer import Trainer
-    from lightning.pytorch.utilities import rank_zero_info
-    LIGHTNING_PACK_NAME = "lightning.pytorch."
-except:
-    from pytorch_lightning import seed_everything
-    from pytorch_lightning.callbacks import Callback
-    from pytorch_lightning.trainer import Trainer
-    from pytorch_lightning.utilities import rank_zero_info
-    LIGHTNING_PACK_NAME = "pytorch_lightning."
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
@@ -145,7 +135,7 @@ def get_parser(**parser_kwargs):
         type=int,
         default=0.15,
         help="halt training once this CLIP validation score or a higher one is achieved."
-             "if used with --fid_threshold, both metrics need to reach their targets.",
+             "if used with --clip_threshold, both metrics need to reach their targets.",
     )
     parser.add_argument(
         "-f",
@@ -158,7 +148,7 @@ def get_parser(**parser_kwargs):
         "-l",
         "--logdir",
         type=str,
-        default="/results",
+        default="/tmp/stable_diffusion/results",
         help="directory for logging dat shit",
     )
     parser.add_argument(
@@ -327,6 +317,53 @@ class CUDACallback(Callback):
             pass
 
 
+class DummyDataModule(pl.LightningDataModule):
+    def __init__(self, batch_size=4, image_size=64, num_samples=100):
+        super().__init__()
+        self.batch_size = batch_size
+        self.image_size = image_size
+        self.num_samples = num_samples
+        self.device = 'cpu'  # Always create on CPU, Lightning will handle device movement
+        print("Batch size", self.batch_size)
+
+    def setup(self, stage=None):
+        # Generate random image and text data
+        self.train_images = torch.randn(self.num_samples, 3, self.image_size, self.image_size, device=self.device, dtype=torch.float32)
+        self.train_texts = [f"Sample text {i}" for i in range(self.num_samples)]
+        self.val_images = torch.randn(self.num_samples // 10, 3, self.image_size, self.image_size, device=self.device, dtype=torch.float32)
+        self.val_texts = [f"Val text {i}" for i in range(self.num_samples // 10)]
+
+    def train_dataloader(self):
+        dataset = [{'npy': img, 'txt': txt, 'caption': txt} for img, txt in zip(self.train_images, self.train_texts)]
+        return DataLoader(dataset, batch_size=self.batch_size, shuffle=True, collate_fn=self._collate_fn)
+
+    def val_dataloader(self):
+        dataset = [{'npy': img, 'txt': txt, 'caption': txt, 'image_id': f"dummy_{i}", 'id': i} 
+                  for i, (img, txt) in enumerate(zip(self.val_images, self.val_texts))]
+        return DataLoader(dataset, batch_size=self.batch_size, collate_fn=self._collate_fn)
+
+    def _collate_fn(self, batch):
+        # Collate function to create batches in the correct format
+        collated = {
+            'npy': torch.stack([item['npy'] for item in batch]).float(),  # Ensure float32
+            'txt': [item['txt'] for item in batch],
+            'caption': [item['caption'] for item in batch],
+        }
+        # Add validation-specific fields if they exist
+        if 'image_id' in batch[0]:
+            collated.update({
+                'image_id': [item['image_id'] for item in batch],
+                'id': [item['id'] for item in batch],
+            })
+        return collated
+
+    def on_before_batch_transfer(self, batch, dataloader_idx):
+        # Ensure tensors are on CPU before Lightning moves them
+        if isinstance(batch, dict) and 'npy' in batch:
+            batch['npy'] = batch['npy'].to('cpu')
+        return batch
+
+
 if __name__ == "__main__":
     # custom parser to specify config files, train, test and debug mode,
     # postfix, resume.
@@ -452,41 +489,145 @@ if __name__ == "__main__":
 
     # Intinalize and save configuratioon using the OmegaConf library.
     try:
+        trainer = None  # Initialize trainer to None at start
         # init and save configs
-        configs = [OmegaConf.load(cfg) for cfg in opt.base]
-        cli = OmegaConf.from_dotlist(unknown)
-        config = OmegaConf.merge(*configs, cli)
+        if len(opt.base) == 0:
+            rank_zero_info("No base config specified. Using default configuration from train_01x08x08.yaml")
+            default_config_path = os.path.join(os.path.dirname(__file__), "configs", "train_01x08x08.yaml")
+            if os.path.exists(default_config_path):
+                config = OmegaConf.load(default_config_path)
+                
+                # Update paths to use /tmp
+                if "validation_config" in config.model.params:
+                    if "save_images" in config.model.params.validation_config:
+                        config.model.params.validation_config.save_images.base_output_dir = "/tmp/stable_diffusion/results"
+                    if "fid" in config.model.params.validation_config:
+                        config.model.params.validation_config.fid.cache_dir = "/tmp/stable_diffusion/checkpoints/inception"
+                        config.model.params.validation_config.fid.gt_path = "/tmp/stable_diffusion/datasets/coco2014/val2014_30k_stats.npz"
+                    if "clip" in config.model.params.validation_config:
+                        config.model.params.validation_config.clip.cache_dir = "/tmp/stable_diffusion/checkpoints/clip"
+                
+                if "cond_stage_config" in config.model.params:
+                    if "params" in config.model.params.cond_stage_config:
+                        config.model.params.cond_stage_config.params.cache_dir = "/tmp/stable_diffusion/checkpoints/clip"
+
+                # Update data paths
+                if "data" in config and "params" in config.data:
+                    if "train" in config.data.params and "params" in config.data.params.train:
+                        if "urls" in config.data.params.train.params:
+                            config.data.params.train.params.urls = "/tmp/stable_diffusion/datasets/laion-400m/webdataset-moments-filtered/{00000..00831}.tar"
+                    if "validation" in config.data.params and "params" in config.data.params.validation:
+                        if "annotations_file" in config.data.params.validation.params:
+                            config.data.params.validation.params.annotations_file = "/tmp/stable_diffusion/datasets/coco2014/val2014_30k.tsv"
+
+                # Create all necessary directories
+                os.makedirs("/tmp/stable_diffusion/checkpoints/inception", exist_ok=True)
+                os.makedirs("/tmp/stable_diffusion/checkpoints/clip", exist_ok=True)
+                os.makedirs("/tmp/stable_diffusion/checkpoints/models", exist_ok=True)
+                os.makedirs("/tmp/stable_diffusion/results", exist_ok=True)
+                os.makedirs("/tmp/stable_diffusion/datasets/coco2014", exist_ok=True)
+                os.makedirs("/tmp/stable_diffusion/datasets/laion-400m/webdataset-moments-filtered", exist_ok=True)
+
+                # Set environment variables for model caching
+                os.environ["TORCH_HOME"] = "/tmp/stable_diffusion/checkpoints"  # For torch hub cache
+                os.environ["HF_HOME"] = "/tmp/stable_diffusion/checkpoints/huggingface"  # For HuggingFace cache
+                os.environ["XDG_CACHE_HOME"] = "/tmp/stable_diffusion/checkpoints"  # For general cache
+            else:
+                raise ValueError(f"Default config file not found at {default_config_path}")
+        else:
+            configs = [OmegaConf.load(cfg) for cfg in opt.base]
+            cli = OmegaConf.from_dotlist(unknown)
+            config = OmegaConf.merge(*configs, cli)
+
+        # Extract lightning config
         lightning_config = config.pop("lightning", OmegaConf.create())
+
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
 
-        for k in nondefault_trainer_args(opt):
-            trainer_config[k] = getattr(opt, k)
+        # Update trainer configuration to use 1 GPU
+        if "lightning" in config:
+            if "trainer" in config.lightning:
+                config.lightning.trainer.devices = 1
+                config.lightning.trainer.num_nodes = 1
+                if "strategy" in config.lightning.trainer:
+                    del config.lightning.trainer.strategy
 
-        # Check whether the accelerator is gpu
-        if not trainer_config["accelerator"] == "gpu":
-            del trainer_config["accelerator"]
+        # Set defaults for trainer config
+        default_trainer_config = {
+            "accelerator": "gpu" if torch.cuda.is_available() else "cpu",
+            "devices": 1,
+            "num_nodes": 1,
+            "precision": "32-true",
+            "logger": True,
+            "callbacks": [],
+            "max_epochs": 1000,
+        }
+        for k, v in default_trainer_config.items():
+            if k not in trainer_config:
+                trainer_config[k] = v
+
+        if trainer_config.get("accelerator") != "gpu":
             cpu = True
+            rank_zero_info("Using CPU")
         else:
             cpu = False
-        trainer_opt = argparse.Namespace(**trainer_config)
-        lightning_config.trainer = trainer_config
+            if trainer_config.get("devices") > 1:
+                rank_zero_info(f"Using {trainer_config.devices} GPUs")
+            else:
+                rank_zero_info("Using single GPU")
 
-        # model
-        use_fp16 = trainer_config.get("precision", 32) == 16
-        if use_fp16:
-            config.model["params"].update({"use_fp16": True})
-        else:
-            config.model["params"].update({"use_fp16": False})
-
-        if ckpt is not None:
-            # If a checkpoint path is specified in the ckpt variable, the code updates the "ckpt" key in the "params" dictionary of the config.model configuration with the value of ckpt
-            config.model["params"].update({"ckpt": ckpt})
-            rank_zero_info("Using ckpt_path = {}".format(config.model["params"]["ckpt"]))
-
+        # Determine device based on trainer config
+        device = "cuda" if torch.cuda.is_available() and trainer_config.get("accelerator", "gpu") == "gpu" else "cpu"
+        
+        # Create model
         model = instantiate_from_config(config.model)
-        # trainer and callbacks
-        trainer_kwargs = dict()
+        model = model.to(device)
+        
+        # Ensure all submodules are on the same device
+        for module in model.modules():
+            # Only set device attribute if it exists and is writable
+            if hasattr(module, 'device') and isinstance(getattr(type(module), 'device', None), property):
+                if hasattr(type(module).device, 'fset') and type(module).device.fset is not None:
+                    module.device = device
+            module.to(device)
+
+        # Update trainer config to ensure data is moved to correct device
+        if device == "cuda":
+            trainer_config.accelerator = "gpu"
+            trainer_config.devices = 1
+        else:
+            trainer_config.accelerator = "cpu"
+            trainer_config.devices = None
+
+        # Set defaults for trainer config
+        default_trainer_config = {
+            "accelerator": "gpu" if device == "cuda" else "cpu",
+            "devices": 1 if device == "cuda" else None,
+            "num_nodes": 1,
+            "precision": "32-true",
+            "logger": True,
+            "callbacks": [],
+            "max_epochs": 1000,
+        }
+
+        for k in default_trainer_config:
+            if k not in trainer_config:
+                trainer_config[k] = default_trainer_config[k]
+
+        trainer_kwargs = OmegaConf.to_container(trainer_config)
+
+        # Add model-specific callbacks
+        # Callbacks are always called with model and device
+        callbacks = [SetupCallback(resume=opt.resume, now=now, logdir=logdir, ckptdir=ckptdir,
+                                 cfgdir=cfgdir, config=config, lightning_config=lightning_config)]
+
+        if "callbacks" in lightning_config:
+            for key in lightning_config.callbacks:
+                logger.info(f"Adding callback <{key}>")
+                callbacks.append(instantiate_from_config(lightning_config.callbacks[key]))
+
+        trainer_kwargs["callbacks"] = callbacks
 
         # config the logger
         # Default logger configs to  log training metrics during the training process.
@@ -587,12 +728,14 @@ if __name__ == "__main__":
         # modelcheckpoint - use TrainResult/EvalResult(checkpoint_on=metric) to
         # specify which metric is used to determine best models
         default_modelckpt_cfg = {
-            "target": LIGHTNING_PACK_NAME + "callbacks.ModelCheckpoint",
+            "target": "lightning.pytorch.callbacks.ModelCheckpoint",
             "params": {
-                "dirpath": ckptdir,
-                "filename": "{epoch:06}-{step:09}",
+                "dirpath": "/tmp/stable_diffusion/checkpoints/models",
+                "filename": "{epoch:06}",
                 "verbose": True,
                 "save_last": True,
+                "every_n_train_steps": 1000,
+                "save_top_k": -1,
             }
         }
 
@@ -603,12 +746,51 @@ if __name__ == "__main__":
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
         trainer_kwargs["callbacks"].append(instantiate_from_config(modelckpt_cfg))
 
+        # Check if real datasets are available
+        laion_path = "/tmp/stable_diffusion/datasets/laion-400m/webdataset-moments-filtered/00000.tar"
+        coco_path = "/tmp/stable_diffusion/datasets/coco2014/val2014_30k.tsv"
+        
+        if not os.path.exists(laion_path) or not os.path.exists(coco_path):
+            rank_zero_info("Required datasets not found. Using dummy data.")
+            rank_zero_info(f"LAION dataset exists: {os.path.exists(laion_path)}")
+            rank_zero_info(f"COCO dataset exists: {os.path.exists(coco_path)}")
+            
+            # Store original batch sizes
+            train_batch_size = config.data.params.train.params.batch_size if "data" in config and "params" in config.data and "train" in config.data.params and "params" in config.data.params.train and "batch_size" in config.data.params.train.params else 8
+            val_batch_size = config.data.params.validation.params.batch_size if "data" in config and "params" in config.data and "validation" in config.data.params and "params" in config.data.params.validation and "batch_size" in config.data.params.validation.params else 8
+            
+            # Switch to dummy data configuration
+            config.data = {
+                "target": "dummy",
+                "params": {
+                    "train": {
+                        "params": {
+                            "batch_size": train_batch_size
+                        }
+                    },
+                    "validation": {
+                        "params": {
+                            "batch_size": val_batch_size
+                        }
+                    },
+                    "image_size": config.model.params.image_size,
+                    "num_samples": 1000
+                }
+            }
+
         # Create a Trainer object with the specified command-line arguments and keyword arguments, and set the log directory
-        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+        trainer = Trainer.from_argparse_args(opt, **trainer_kwargs)
         trainer.logdir = logdir
 
         # Create a data module based on the configuration file
-        data = instantiate_from_config(config.data)
+        if hasattr(config.data, "target") and config.data.target == "dummy":
+            data = DummyDataModule(
+                batch_size=config.data.params.train.params.batch_size,
+                image_size=config.data.params.image_size,
+                num_samples=config.data.params.num_samples
+            )
+        else:
+            data = instantiate_from_config(config.data)
         # We can't get number of samples without reading the data (which we can't inside the init block), so we hard code them
         mllogger.event(key=mllog_constants.TRAIN_SAMPLES, value=6513144)
         mllogger.event(key=mllog_constants.EVAL_SAMPLES, value=30000)
@@ -650,7 +832,7 @@ if __name__ == "__main__":
             # run all checkpoint hooks
             if trainer.global_rank == 0:
                 print("Summoning checkpoint.")
-                ckpt_path = os.path.join(ckptdir, "last.ckpt")
+                ckpt_path = os.path.join("/tmp/stable_diffusion/checkpoints/models", "last.ckpt")
                 trainer.save_checkpoint(ckpt_path)
 
         def divein(*args, **kwargs):
@@ -698,12 +880,10 @@ if __name__ == "__main__":
         raise
     finally:
         #  Move the log directory to debug_runs if opt.debug is true and the trainer's global
-        if opt.debug and not opt.resume and trainer.global_rank == 0:
+        if opt.debug and not opt.resume and trainer is not None and trainer.global_rank == 0:
             dst, name = os.path.split(logdir)
             dst = os.path.join(dst, "debug_runs", name)
             os.makedirs(os.path.split(dst)[0], exist_ok=True)
             os.rename(logdir, dst)
-        if trainer.global_rank == 0:
-            print(trainer.profiler.summary())
-
-        mllogger.event(mllog_constants.STATUS, value=status)
+        if trainer is not None:  # Only log status if trainer was created
+            mllogger.event(mllog_constants.STATUS, value=status)

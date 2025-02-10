@@ -33,11 +33,14 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
                  freeze=True, layer="last", cache_dir=None):
         super().__init__()
         assert layer in self.LAYERS
-        model, _, _ = open_clip.create_model_and_transforms(arch, device=torch.device('cpu'), pretrained=version, cache_dir=cache_dir)
+        self.device = device
+        
+        # Create model on CPU first
+        model, _, _ = open_clip.create_model_and_transforms(arch, device=torch.device('cpu'), 
+                                                          pretrained=version, cache_dir=cache_dir)
         del model.visual
         self.model = model
 
-        self.device = device
         self.max_length = max_length
         if freeze:
             self.freeze()
@@ -48,6 +51,11 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
             self.layer_idx = 1
         else:
             raise NotImplementedError()
+        
+        # Move model and all submodules to specified device
+        self.model = self.model.to(self.device)
+        for module in self.model.modules():
+            module.to(self.device)
 
     def freeze(self):
         self.model = self.model.eval()
@@ -56,7 +64,8 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
 
     def forward(self, text):
         tokens = open_clip.tokenize(text)
-        z = self.encode_with_transformer(tokens.to(self.device))
+        tokens = tokens.to(self.device)
+        z = self.encode_with_transformer(tokens)
         return z
 
     def encode_with_transformer(self, text):
