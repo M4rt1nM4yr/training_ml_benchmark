@@ -56,8 +56,6 @@ def main():
         devices=1,
         max_epochs=1,
         precision="32",
-        limit_train_batches=50,
-        limit_val_batches=10,
     )
 
     # Train model
